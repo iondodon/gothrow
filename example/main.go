@@ -1,13 +1,11 @@
 package main
 
 import (
-	"errors"
 	"fmt"
 	"os"
-)
 
-type A struct {
-}
+	"gothrow/example/pkg1"
+)
 
 func main() {
 	_, _ = os.ReadFile("test.txt")
@@ -15,11 +13,7 @@ func main() {
 	fmt.Println(a, b, c)
 }
 
-func anotherFunc() (int, string, error) {
-	return 0, "", errors.New("erroroooorrrr")
-}
-
-func anotherFuncWithIgnoredError() (int, string, A, error) {
-	i, s, _ := anotherFunc()
-	return i, s, A{}, nil
+func anotherFuncWithIgnoredError() (int, string, pkg1.A, error) {
+	i, s, a, _ := pkg1.P1()
+	return i, s, a, nil
 } 
