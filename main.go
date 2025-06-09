@@ -245,10 +245,13 @@ func zeroValue(t ast.Expr) ast.Expr {
 		case "bool":
 			return &ast.Ident{Name: "false"}
 		default:
-			return &ast.Ident{Name: "nil"}
+			// Assume it's a struct type
+			return &ast.CompositeLit{Type: v}
 		}
 	case *ast.StarExpr, *ast.ArrayType, *ast.MapType, *ast.ChanType, *ast.InterfaceType, *ast.FuncType:
 		return &ast.Ident{Name: "nil"}
+	case *ast.SelectorExpr: // For types like a.B
+		return &ast.CompositeLit{Type: t}
 	default:
 		return &ast.Ident{Name: "nil"} // best guess
 	}

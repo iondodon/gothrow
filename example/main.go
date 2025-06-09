@@ -1,20 +1,25 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 )
 
+type A struct {
+}
+
 func main() {
-	content, _ := os.ReadFile("test.txt")
-	fmt.Println(string(content))
+	_, _ = os.ReadFile("test.txt")
+	a, b, c, _ := anotherFuncWithIgnoredError()
+	fmt.Println(a, b, c)
 }
 
 func anotherFunc() (int, string, error) {
-	return 1, "hello", nil
+	return 0, "", errors.New("erroroooorrrr")
 }
 
-func anotherFuncWithIgnoredError() (int, string, error) {
+func anotherFuncWithIgnoredError() (int, string, A, error) {
 	i, s, _ := anotherFunc()
-	return i, s, nil
+	return i, s, A{}, nil
 } 
