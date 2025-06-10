@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"golang.org/x/tools/go/ast/astutil"
@@ -57,161 +58,115 @@ func main() {
 
 func processFile(pkg *packages.Package, filePath string, node *ast.File, fset *token.FileSet) error {
 	info := pkg.TypesInfo
-	errIntroducedInScope := make(map[*types.Scope]bool)
 
-	var modified bool
+	type modification struct {
+		pos     token.Pos
+		isDemotion bool
+		assign  *ast.AssignStmt
+		errIdx  int
+	}
+	var mods []modification
+
+	// PASS 1 (pre-computation): Collect all potential modifications
 	astutil.Apply(node, func(cursor *astutil.Cursor) bool {
 		stmt, ok := cursor.Node().(ast.Stmt)
-		if !ok {
-			return true
-		}
-
+		if !ok { return true }
 		assign, ok := stmt.(*ast.AssignStmt)
-		if !ok {
-			return true
+		if !ok { return true }
+		if assign.Tok != token.DEFINE && assign.Tok != token.ASSIGN { return true }
+
+		// Check for ignored errors
+		if idx := getErrorIndex(assign, info); idx != -1 && isIgnored(assign.Lhs[idx]) {
+			mods = append(mods, modification{pos: assign.Pos(), assign: assign, errIdx: idx})
+			return true 
 		}
-		if assign.Tok != token.DEFINE && assign.Tok != token.ASSIGN {
-			return true
-		}
-
-		for i, expr := range assign.Lhs {
-			if id, ok := expr.(*ast.Ident); ok && id.Name == "_" {
-				// We have an ignored value
-				if len(assign.Rhs) != 1 {
-					continue
-				}
-				call, ok := assign.Rhs[0].(*ast.CallExpr)
-				if !ok {
-					continue
-				}
-
-				// == BEGIN DIAGNOSTICS ==
-				fmt.Printf("\n[DEBUG] Analyzing call in %s: %s\n", fset.File(call.Pos()).Name(), renderNode(fset, call))
-				callType := info.TypeOf(call)
-				if callType == nil {
-					fmt.Println("[DEBUG] -> Type info is nil. Skipping.")
-					return true
-				}
-				fmt.Printf("[DEBUG] -> Call type: %T | %s\n", callType, callType.String())
-				// == END DIAGNOSTICS ==
-
-				var sig *types.Tuple
-				switch t := callType.(type) {
-				case *types.Signature:
-					sig = t.Results()
-				case *types.Tuple:
-					sig = t
-				default:
-					return true // Not a function call we can analyze.
-				}
-
-				if sig.Len() != len(assign.Lhs) {
-					continue
-				}
-
-				if i >= sig.Len() {
-					continue
-				}
-				v := sig.At(i)
-
-				// == BEGIN DIAGNOSTICS ==
-				vType := v.Type()
-				isErr := isErrorType(vType)
-				fmt.Printf("[DEBUG] -> Return value %d: Type=`%s`, IsError=%v\n", i, vType.String(), isErr)
-				// == END DIAGNOSTICS ==
-
-				if isErr {
-					modified = true
-
-					// Find the current scope and check if `err` is already declared there or in a parent scope.
-					scope := innermostScope(node, stmt, info)
-					isErrDeclared := false
-					if scope != nil {
-						tempScope := scope
-						for tempScope != nil {
-							if tempScope.Lookup("err") != nil || errIntroducedInScope[tempScope] {
-								isErrDeclared = true
-								break
-							}
-							tempScope = tempScope.Parent()
-						}
-					}
-
-					// Decide whether to use `=` or `:=`
-					tok := assign.Tok
-					if tok == token.ASSIGN {
-						if !isErrDeclared {
-							tok = token.DEFINE
-							if scope != nil {
-								errIntroducedInScope[scope] = true
-							}
-						}
-					} else { // token.DEFINE
-						if isErrDeclared {
-							// If `err` is already declared, and no other variables on the LHS are new,
-							// we must demote to `=`.
-							anyOtherNew := false
-							for j, lhsExpr := range assign.Lhs {
-								if i == j {
-									continue
-								}
-								if id, ok := lhsExpr.(*ast.Ident); ok {
-									if info.Defs[id] != nil {
-										anyOtherNew = true
-										break
-									}
-								}
-							}
-							if !anyOtherNew {
-								tok = token.ASSIGN
-							}
-						} else {
-							// It was `:=` and we are introducing a new `err` variable.
-							if scope != nil {
-								errIntroducedInScope[scope] = true
-							}
-						}
-					}
-
-					// It's an error type!
-					fmt.Printf("Found ignored error in %s at line %d\n", fset.File(assign.Pos()).Name(), fset.Position(assign.Pos()).Line)
-
-					// Rewrite
-					assign.Lhs[i] = &ast.Ident{Name: "err"}
-					assign.Tok = tok
-
-					// Find enclosing function
-					enclosingFunc := findEnclosingFunc(node, assign.Pos())
-					if enclosingFunc == nil {
-						log.Printf("Could not find enclosing function for assignment at %s", fset.Position(assign.Pos()))
-						return true
-					}
-
-					if enclosingFunc.Name.Name == "main" {
-						// Special handling for main
-						modified = true
-						astutil.AddImport(fset, node, "log")
-						assign.Lhs[i] = &ast.Ident{Name: "err"}
-						ifStmt := createErrorCheckForMain()
-						cursor.InsertAfter(ifStmt)
-						return true
-					}
-
-					// Check if enclosing function can return an error
-					if !canReturnError(enclosingFunc) {
-						log.Printf("Skipping ignored error in %s at line %d because enclosing function does not return an error", fset.File(assign.Pos()).Name(), fset.Position(assign.Pos()).Line)
-						return true
-					}
-
-					// Create the if statement
-					ifStmt := createErrorCheck(enclosingFunc)
-
-					// Insert the if statement
-					cursor.InsertAfter(ifStmt)
-				}
+		
+		// Check for `err :=` that might need demotion
+		if assign.Tok == token.DEFINE && len(assign.Lhs) == 1 {
+			if id, ok := assign.Lhs[0].(*ast.Ident); ok && id.Name == "err" {
+				mods = append(mods, modification{pos: assign.Pos(), isDemotion: true, assign: assign})
 			}
 		}
 
+		return true
+	}, nil)
+
+	if len(mods) == 0 {
+		return nil
+	}
+
+	// Sort modifications by source code position
+	sort.Slice(mods, func(i, j int) bool {
+		return mods[i].pos < mods[j].pos
+	})
+
+	// PASS 2: Apply modifications in order, using a new traversal to get a valid cursor
+	modIndex := 0
+	errIntroducedInFunc := make(map[*ast.FuncDecl]bool)
+	var modified bool
+
+	astutil.Apply(node, func(cursor *astutil.Cursor) bool {
+		if modIndex >= len(mods) {
+			return false // Stop traversal if all mods are done
+		}
+
+		stmt, ok := cursor.Node().(ast.Stmt)
+		if !ok { return true }
+		
+		currentMod := mods[modIndex]
+		if stmt != currentMod.assign {
+			return true // Not the statement we're looking for yet
+		}
+		
+		// We are at the right statement, apply the modification
+		assign := currentMod.assign
+		scope := innermostScope(node, assign, info)
+		enclosingFunc := findEnclosingFunc(node, assign.Pos())
+		if enclosingFunc == nil {
+			log.Printf("Skipping modification at %s because enclosing function could not be found.", fset.Position(assign.Pos()))
+			modIndex++
+			return true
+		}
+
+		if currentMod.isDemotion {
+			isDeclaredInTypes := scope != nil && scope.Lookup("err") != nil
+			isDeclaredByUs := errIntroducedInFunc[enclosingFunc]
+
+			if isDeclaredByUs || isDeclaredInTypes {
+				fmt.Printf("Demoting `err :=` to `err =` in %s at line %d\n", fset.File(assign.Pos()).Name(), fset.Position(assign.Pos()).Line)
+				assign.Tok = token.ASSIGN
+				modified = true
+			}
+			errIntroducedInFunc[enclosingFunc] = true
+		} else {
+			fmt.Printf("Found ignored error in %s at line %d\n", fset.File(assign.Pos()).Name(), fset.Position(assign.Pos()).Line)
+			modified = true
+
+			isErrAlreadyDeclared := errIntroducedInFunc[enclosingFunc] || (scope != nil && scope.Lookup("err") != nil)
+			tok := assign.Tok
+			if tok == token.ASSIGN && !isErrAlreadyDeclared {
+				tok = token.DEFINE
+			} else if tok == token.DEFINE && isErrAlreadyDeclared {
+				if !anyOtherNewVariables(assign, currentMod.errIdx, info) {
+					tok = token.ASSIGN
+				}
+			}
+			if tok == token.DEFINE && !isErrAlreadyDeclared {
+				errIntroducedInFunc[enclosingFunc] = true
+			}
+
+			assign.Lhs[currentMod.errIdx] = &ast.Ident{Name: "err"}
+			assign.Tok = tok
+			
+			if enclosingFunc.Name.Name == "main" {
+				astutil.AddImport(fset, node, "log")
+				cursor.InsertAfter(createErrorCheckForMain())
+			} else if canReturnError(enclosingFunc) {
+				cursor.InsertAfter(createErrorCheck(enclosingFunc))
+			}
+		}
+		
+		modIndex++ // Move to the next modification
 		return true
 	}, nil)
 
@@ -359,6 +314,60 @@ func createErrorCheckForMain() *ast.IfStmt {
 	}
 }
 
+func getErrorIndex(assign *ast.AssignStmt, info *types.Info) int {
+	if len(assign.Rhs) != 1 {
+		return -1
+	}
+	call, ok := assign.Rhs[0].(*ast.CallExpr)
+	if !ok {
+		return -1
+	}
+	var sig *types.Tuple
+	if callType := info.TypeOf(call); callType != nil {
+		switch t := callType.(type) {
+		case *types.Signature:
+			sig = t.Results()
+		case *types.Tuple:
+			sig = t
+		}
+	}
+	if sig == nil {
+		return -1
+	}
+
+	for i := 0; i < sig.Len(); i++ {
+		if isErrorType(sig.At(i).Type()) {
+			return i
+		}
+	}
+	return -1
+}
+
+func anyOtherNewVariables(assign *ast.AssignStmt, errIdx int, info *types.Info) bool {
+	for i, lhsExpr := range assign.Lhs {
+		if i == errIdx {
+			continue
+		}
+		if id, ok := lhsExpr.(*ast.Ident); ok {
+			if info.Defs[id] != nil {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isErrAlreadyDeclared(scope *types.Scope) bool {
+	if scope == nil {
+		return false
+	}
+	// If not in our map, check the type info by looking in parent scopes
+	if scope.Lookup("err") != nil {
+		return true
+	}
+	return false
+}
+
 // innermostScope finds the narrowest scope enclosing a statement.
 func innermostScope(file *ast.File, stmt ast.Stmt, info *types.Info) *types.Scope {
 	path, _ := astutil.PathEnclosingInterval(file, stmt.Pos(), stmt.End())
@@ -372,4 +381,9 @@ func innermostScope(file *ast.File, stmt ast.Stmt, info *types.Info) *types.Scop
 		}
 	}
 	return nil
+}
+
+func isIgnored(e ast.Expr) bool {
+	id, ok := e.(*ast.Ident)
+	return ok && id.Name == "_"
 } 
