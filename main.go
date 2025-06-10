@@ -57,6 +57,7 @@ func main() {
 
 func processFile(pkg *packages.Package, filePath string, node *ast.File, fset *token.FileSet) error {
 	info := pkg.TypesInfo
+	errIntroducedInScope := make(map[*types.Scope]bool)
 
 	var modified bool
 	astutil.Apply(node, func(cursor *astutil.Cursor) bool {
@@ -66,7 +67,10 @@ func processFile(pkg *packages.Package, filePath string, node *ast.File, fset *t
 		}
 
 		assign, ok := stmt.(*ast.AssignStmt)
-		if !ok || assign.Tok != token.DEFINE {
+		if !ok {
+			return true
+		}
+		if assign.Tok != token.DEFINE && assign.Tok != token.ASSIGN {
 			return true
 		}
 
@@ -81,23 +85,100 @@ func processFile(pkg *packages.Package, filePath string, node *ast.File, fset *t
 					continue
 				}
 
-				if info.TypeOf(call) == nil {
+				// == BEGIN DIAGNOSTICS ==
+				fmt.Printf("\n[DEBUG] Analyzing call in %s: %s\n", fset.File(call.Pos()).Name(), renderNode(fset, call))
+				callType := info.TypeOf(call)
+				if callType == nil {
+					fmt.Println("[DEBUG] -> Type info is nil. Skipping.")
 					return true
 				}
+				fmt.Printf("[DEBUG] -> Call type: %T | %s\n", callType, callType.String())
+				// == END DIAGNOSTICS ==
 
-				if info.TypeOf(call).(*types.Tuple).Len() != len(assign.Lhs) {
+				var sig *types.Tuple
+				switch t := callType.(type) {
+				case *types.Signature:
+					sig = t.Results()
+				case *types.Tuple:
+					sig = t
+				default:
+					return true // Not a function call we can analyze.
+				}
+
+				if sig.Len() != len(assign.Lhs) {
 					continue
 				}
 
-				if i >= info.TypeOf(call).(*types.Tuple).Len() {
+				if i >= sig.Len() {
 					continue
 				}
-				tup := info.TypeOf(call).(*types.Tuple)
-				v := tup.At(i)
+				v := sig.At(i)
 
-				if v != nil && types.Implements(v.Type(), types.Universe.Lookup("error").Type().Underlying().(*types.Interface)) {
+				// == BEGIN DIAGNOSTICS ==
+				vType := v.Type()
+				isErr := isErrorType(vType)
+				fmt.Printf("[DEBUG] -> Return value %d: Type=`%s`, IsError=%v\n", i, vType.String(), isErr)
+				// == END DIAGNOSTICS ==
+
+				if isErr {
+					modified = true
+
+					// Find the current scope and check if `err` is already declared there or in a parent scope.
+					scope := innermostScope(node, stmt, info)
+					isErrDeclared := false
+					if scope != nil {
+						tempScope := scope
+						for tempScope != nil {
+							if tempScope.Lookup("err") != nil || errIntroducedInScope[tempScope] {
+								isErrDeclared = true
+								break
+							}
+							tempScope = tempScope.Parent()
+						}
+					}
+
+					// Decide whether to use `=` or `:=`
+					tok := assign.Tok
+					if tok == token.ASSIGN {
+						if !isErrDeclared {
+							tok = token.DEFINE
+							if scope != nil {
+								errIntroducedInScope[scope] = true
+							}
+						}
+					} else { // token.DEFINE
+						if isErrDeclared {
+							// If `err` is already declared, and no other variables on the LHS are new,
+							// we must demote to `=`.
+							anyOtherNew := false
+							for j, lhsExpr := range assign.Lhs {
+								if i == j {
+									continue
+								}
+								if id, ok := lhsExpr.(*ast.Ident); ok {
+									if info.Defs[id] != nil {
+										anyOtherNew = true
+										break
+									}
+								}
+							}
+							if !anyOtherNew {
+								tok = token.ASSIGN
+							}
+						} else {
+							// It was `:=` and we are introducing a new `err` variable.
+							if scope != nil {
+								errIntroducedInScope[scope] = true
+							}
+						}
+					}
+
 					// It's an error type!
-					fmt.Printf("Found ignored error in %s at position %d\n", fset.File(assign.Pos()).Name(), fset.Position(assign.Pos()).Line)
+					fmt.Printf("Found ignored error in %s at line %d\n", fset.File(assign.Pos()).Name(), fset.Position(assign.Pos()).Line)
+
+					// Rewrite
+					assign.Lhs[i] = &ast.Ident{Name: "err"}
+					assign.Tok = tok
 
 					// Find enclosing function
 					enclosingFunc := findEnclosingFunc(node, assign.Pos())
@@ -118,19 +199,14 @@ func processFile(pkg *packages.Package, filePath string, node *ast.File, fset *t
 
 					// Check if enclosing function can return an error
 					if !canReturnError(enclosingFunc) {
-						log.Printf("Skipping ignored error in %s at position %d because enclosing function does not return an error", fset.File(assign.Pos()).Name(), fset.Position(assign.Pos()).Line)
+						log.Printf("Skipping ignored error in %s at line %d because enclosing function does not return an error", fset.File(assign.Pos()).Name(), fset.Position(assign.Pos()).Line)
 						return true
 					}
 
-					// Rewrite
-					// 1. change `_` to `err`
-					modified = true
-					assign.Lhs[i] = &ast.Ident{Name: "err"}
-
-					// 2. Create the if statement
+					// Create the if statement
 					ifStmt := createErrorCheck(enclosingFunc)
 
-					// 3. Insert the if statement
+					// Insert the if statement
 					cursor.InsertAfter(ifStmt)
 				}
 			}
@@ -148,7 +224,29 @@ func processFile(pkg *packages.Package, filePath string, node *ast.File, fset *t
 		return fmt.Errorf("failed to format node: %w", err)
 	}
 
+	fmt.Printf("Writing modified file: %s\n", filePath)
 	return os.WriteFile(filePath, buf.Bytes(), 0644)
+}
+
+func renderNode(fset *token.FileSet, node ast.Node) string {
+	var buf bytes.Buffer
+	if err := format.Node(&buf, fset, node); err != nil {
+		return fmt.Sprintf("error formatting node: %v", err)
+	}
+	return buf.String()
+}
+
+func isErrorType(t types.Type) bool {
+	if t == nil {
+		return false
+	}
+	// The `error` type is a named type, which is an interface.
+	// We can check if a type implements the error interface.
+	errorInterface, ok := types.Universe.Lookup("error").Type().Underlying().(*types.Interface)
+	if !ok {
+		return false // Should not happen
+	}
+	return types.Implements(t, errorInterface)
 }
 
 func canReturnError(fn *ast.FuncDecl) bool {
@@ -199,7 +297,7 @@ func createErrorCheck(enclosingFunc *ast.FuncDecl) *ast.IfStmt {
 	if len(retStmt.Results) > 0 {
 		last := len(retStmt.Results) - 1
 		// Only replace if it is an error type
-		if t, ok := enclosingFunc.Type.Results.List[last].Type.(*ast.Ident); ok && t.Name == "error" {
+		if id, ok := enclosingFunc.Type.Results.List[last].Type.(*ast.Ident); ok && id.Name == "error" {
 			retStmt.Results[last] = &ast.Ident{Name: "err"}
 		}
 	}
@@ -259,4 +357,19 @@ func createErrorCheckForMain() *ast.IfStmt {
 			},
 		},
 	}
+}
+
+// innermostScope finds the narrowest scope enclosing a statement.
+func innermostScope(file *ast.File, stmt ast.Stmt, info *types.Info) *types.Scope {
+	path, _ := astutil.PathEnclosingInterval(file, stmt.Pos(), stmt.End())
+	if path == nil {
+		return nil
+	}
+
+	for i := len(path) - 1; i >= 0; i-- {
+		if scope, ok := info.Scopes[path[i]]; ok {
+			return scope
+		}
+	}
+	return nil
 } 

@@ -20,6 +20,7 @@ go.work
 
 # Local go binary
 gothrow
+main
 /gothrow
 
 # Example output
