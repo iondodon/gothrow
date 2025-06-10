@@ -29,10 +29,16 @@ The key features are:
 
 ## Installation
 
-You can build `gothrow` from the source:
+You can install `gothrow` using `go install`:
 
 ```bash
-go build .
+go install github.com/iondodon/gothrow@latest
+```
+
+Alternatively, you can build it from the source:
+
+```bash
+make build
 ```
 
 This will create a `gothrow` executable in the current directory.
