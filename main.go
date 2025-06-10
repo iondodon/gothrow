@@ -17,8 +17,6 @@ import (
 	"golang.org/x/tools/go/packages"
 )
 
-const outDirName = "out"
-
 func main() {
 	flag.Parse()
 	dir := flag.Arg(0)
@@ -29,14 +27,6 @@ func main() {
 	absDir, err := filepath.Abs(dir)
 	if err != nil {
 		log.Fatalf("failed to get absolute path for %s: %v", dir, err)
-	}
-
-	outAbsDir := filepath.Join(absDir, outDirName)
-	if err := os.RemoveAll(outAbsDir); err != nil {
-		log.Fatalf("failed to remove existing output directory: %v", err)
-	}
-	if err := os.MkdirAll(outAbsDir, 0755); err != nil {
-		log.Fatalf("failed to create output directory: %v", err)
 	}
 
 	cfg := &packages.Config{
@@ -57,7 +47,7 @@ func main() {
 			if !strings.HasPrefix(file, absDir) {
 				continue
 			}
-			err := processFile(pkg, file, fileAst, absDir, outAbsDir, cfg.Fset)
+			err := processFile(pkg, file, fileAst, cfg.Fset)
 			if err != nil {
 				log.Printf("failed to process file %s: %v", file, err)
 			}
@@ -65,29 +55,10 @@ func main() {
 	}
 }
 
-func processFile(pkg *packages.Package, filePath string, node *ast.File, baseDir, outBaseDir string, fset *token.FileSet) error {
-	relPath, err := filepath.Rel(baseDir, filePath)
-	if err != nil {
-		return err
-	}
-	outPath := filepath.Join(outBaseDir, relPath)
-
-	if err := os.MkdirAll(filepath.Dir(outPath), 0755); err != nil {
-		return err
-	}
-
-	input, err := os.ReadFile(filePath)
-	if err != nil {
-		return err
-	}
-
-	if err := os.WriteFile(outPath, input, 0644); err != nil {
-		return err
-	}
-	fmt.Printf("Copied %s to %s\n", filePath, outPath)
-
+func processFile(pkg *packages.Package, filePath string, node *ast.File, fset *token.FileSet) error {
 	info := pkg.TypesInfo
 
+	var modified bool
 	astutil.Apply(node, func(cursor *astutil.Cursor) bool {
 		stmt, ok := cursor.Node().(ast.Stmt)
 		if !ok {
@@ -137,6 +108,7 @@ func processFile(pkg *packages.Package, filePath string, node *ast.File, baseDir
 
 					if enclosingFunc.Name.Name == "main" {
 						// Special handling for main
+						modified = true
 						astutil.AddImport(fset, node, "log")
 						assign.Lhs[i] = &ast.Ident{Name: "err"}
 						ifStmt := createErrorCheckForMain()
@@ -152,6 +124,7 @@ func processFile(pkg *packages.Package, filePath string, node *ast.File, baseDir
 
 					// Rewrite
 					// 1. change `_` to `err`
+					modified = true
 					assign.Lhs[i] = &ast.Ident{Name: "err"}
 
 					// 2. Create the if statement
@@ -166,12 +139,16 @@ func processFile(pkg *packages.Package, filePath string, node *ast.File, baseDir
 		return true
 	}, nil)
 
+	if !modified {
+		return nil
+	}
+
 	var buf bytes.Buffer
 	if err := format.Node(&buf, fset, node); err != nil {
 		return fmt.Errorf("failed to format node: %w", err)
 	}
 
-	return os.WriteFile(outPath, buf.Bytes(), 0644)
+	return os.WriteFile(filePath, buf.Bytes(), 0644)
 }
 
 func canReturnError(fn *ast.FuncDecl) bool {

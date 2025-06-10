@@ -14,17 +14,15 @@ all: run
 # Generate the error-handled code using gothrow
 generate:
 	@echo "Running gothrow to generate code..."
-	$(GOTHROW_TOOL) .
+	rm -rf out
+	mkdir -p out
+	cp -r ./* out/
+	$(GOTHROW_TOOL) ./out
 
 # Run the generated code
 run: generate
 	@echo "Running generated code..."
 	@cd out && $(GORUN) .
-
-# Run the original example code
-run-original:
-	@echo "Running original code..."
-	$(GORUN) .
 
 # Clean up the generated code
 clean:

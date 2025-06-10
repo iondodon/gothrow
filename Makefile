@@ -18,8 +18,12 @@ build:
 
 # Run gothrow on the example directory
 run: build
-	@echo "Running $(BINARY_NAME) on $(EXAMPLE_DIR)..."
-	./$(BINARY_NAME) $(EXAMPLE_DIR)
+	@echo "Preparing out directory..."
+	rm -rf $(EXAMPLE_DIR)/out
+	mkdir -p $(EXAMPLE_DIR)/out
+	cp -r $(EXAMPLE_DIR)/* $(EXAMPLE_DIR)/out/
+	@echo "Running $(BINARY_NAME) on $(EXAMPLE_DIR)/out..."
+	./$(BINARY_NAME) $(EXAMPLE_DIR)/out
 
 # Clean up build artifacts and generated code
 clean:
